@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jevjoke — JEV Joke Rater</title>
+<style>
+  :root { --bg:#0f1220; --card:#1a1f35; --accent:#7c5cff; --accent2:#00d4ff;
+          --text:#e8eaf6; --muted:#9aa3c7; --good:#2ecc71; --warn:#ff5c7a; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:radial-gradient(1200px 600px at 20% 0%, #232a4d 0%, var(--bg) 60%);
+         font-family:"Segoe UI", system-ui, sans-serif; color:var(--text); padding:24px; }
+  .card { width:100%; max-width:640px; background:var(--card); border-radius:16px;
+          padding:32px; box-shadow:0 20px 60px rgba(0,0,0,.5); }
+  h1 { margin:0 0 4px; font-size:28px;
+       background:linear-gradient(90deg,var(--accent),var(--accent2));
+       -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .sub { color:var(--muted); font-size:14px; margin-bottom:20px; }
+  textarea { width:100%; min-height:120px; resize:vertical; border-radius:10px;
+             border:1px solid #2c3454; background:#12162a; color:var(--text);
+             padding:14px; font-size:15px; font-family:inherit; }
+  textarea:focus, input:focus { outline:2px solid var(--accent); }
+  button { margin-top:14px; width:100%; padding:14px; border:0; border-radius:10px;
+           background:linear-gradient(90deg,var(--accent),var(--accent2));
+           color:#fff; font-size:16px; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:wait; }
+  .ghost { background:#12162a; border:1px solid #2c3454; font-size:13px;
+           padding:9px; width:auto; margin-top:0; }
+  .keyrow { display:none; margin-bottom:16px; gap:8px; }
+  .keyrow input { flex:1; border-radius:10px; border:1px solid #2c3454;
+                  background:#12162a; color:var(--text); padding:12px; font-size:14px; }
+  .result { margin-top:22px; display:none; }
+  .score-row { display:flex; align-items:baseline; gap:10px; }
+  .score { font-size:52px; font-weight:800; }
+  .score small { font-size:20px; color:var(--muted); font-weight:400; }
+  .bar { flex:1; height:10px; background:#12162a; border-radius:6px; overflow:hidden; }
+  .bar > div { height:100%; background:linear-gradient(90deg,var(--warn),#ffd166,var(--good));
+               width:0; transition:width .6s ease; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
+  .chip { background:#12162a; border:1px solid #2c3454; border-radius:999px;
+          padding:6px 14px; font-size:13px; }
+  .chip b { color:var(--accent2); }
+  .reason { margin-top:14px; color:var(--muted); font-size:14px; font-style:italic; }
+  .err { margin-top:16px; color:var(--warn); font-size:14px; display:none; white-space:pre-wrap; }
+  .logbar { margin-top:22px; display:flex; justify-content:space-between; align-items:center;
+            color:#5b6488; font-size:12px; }
+  a { color:var(--accent2); }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>😂 jevjoke</h1>
+    <div class="sub">Paste a joke below. The <b>JEV</b> model (via OpenRouter) will score it
+      from bone-dry (1) to hilarious (10) and categorize it.</div>
+
+    <div class="keyrow" id="keyrow">
+      <input id="key" type="password" placeholder="OpenRouter API key (sk-or-...) — stored only in your browser">
+      <button class="ghost" onclick="saveKey()">Save key</button>
+    </div>
+
+    <textarea id="joke" placeholder="Why did the chicken cross the road? ..."></textarea>
+    <button id="go" onclick="rate()">Rate this joke</button>
+
+    <div class="result" id="result">
+      <div class="score-row">
+        <div class="score"><span id="score">-</span><small>/10</small></div>
+        <div class="bar"><div id="barfill"></div></div>
+      </div>
+      <div class="chips">
+        <span class="chip">Category: <b id="cat"></b></span>
+        <span class="chip">Foul language: <b id="foul"></b></span>
+        <span class="chip">Style: <b id="style"></b></span>
+      </div>
+      <div class="reason" id="reason"></div>
+    </div>
+    <div class="err" id="err"></div>
+    <div class="logbar">
+      <span>📝 <span id="logcount">0</span> ratings logged in this browser</span>
+      <span>
+        <button class="ghost" onclick="downloadLog()">Download log (.json)</button>
+        <button class="ghost" onclick="resetKey()">Change key</button>
+      </span>
+    </div>
+  </div>
+
+<script>
+const MODEL = 'typesafe/jev-router';
+const SYSTEM = `You are JEV-Judge, a precise joke analysis engine.
+Analyze the joke the user provides and respond with ONLY a single JSON object
+(no markdown, no code fences, no extra text) with exactly these keys:
+
+{
+  "score": <integer 1-10, where 1 = painfully dry / not funny and 10 = extremely funny>,
+  "category": <"Adult" or "General">,
+  "foul_language": <true or false>,
+  "style": <exactly one of: One-Liners | Puns and Wordplay | Dad Jokes | Knock-Knock Jokes | Observational Humor | Riddles | Dark Humor | Slapstick | Deadpan | Anti-Jokes>,
+  "reason": <one short sentence justifying the score>
+}
+
+Rules:
+- "Adult" means sexual, crude, or otherwise 18+ themed content; otherwise "General".
+- "foul_language" is true only if the joke text itself contains profanity/swear words.
+- Pick the single best-fitting style from the list, even if none is perfect.`;
+
+const STYLES = ["One-Liners","Puns and Wordplay","Dad Jokes","Knock-Knock Jokes",
+  "Observational Humor","Riddles","Dark Humor","Slapstick","Deadpan","Anti-Jokes"];
+
+function getKey() { return localStorage.getItem('jevjoke_or_key') || ''; }
+function saveKey() {
+  const k = document.getElementById('key').value.trim();
+  if (!k.startsWith('sk-or-')) { showErr('That doesn\'t look like an OpenRouter key (should start with sk-or-).'); return; }
+  localStorage.setItem('jevjoke_or_key', k);
+  document.getElementById('keyrow').style.display = 'none';
+  hideErr();
+}
+function resetKey() {
+  document.getElementById('keyrow').style.display = 'flex';
+  document.getElementById('key').value = getKey();
+}
+function getLog() { try { return JSON.parse(localStorage.getItem('jevjoke_log') || '[]'); } catch { return []; } }
+function addLog(entry) {
+  const log = getLog(); log.push(entry);
+  localStorage.setItem('jevjoke_log', JSON.stringify(log));
+  document.getElementById('logcount').textContent = log.length;
+}
+function downloadLog() {
+  const blob = new Blob([JSON.stringify(getLog(), null, 2)], {type: 'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'jevjoke_log_' + new Date().toISOString().slice(0,10) + '.json';
+  a.click();
+}
+function showErr(m) { const e = document.getElementById('err'); e.textContent = m; e.style.display = 'block'; }
+function hideErr() { document.getElementById('err').style.display = 'none'; }
+
+function parseResult(content) {
+  let text = content.trim();
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fence) text = fence[1].trim();
+  if (!text.startsWith('{')) {
+    const m = text.match(/\{[\s\S]*\}/);
+    if (m) text = m[0];
+  }
+  const data = JSON.parse(text);
+  let score = Math.round(Number(data.score));
+  if (!isFinite(score)) throw new Error('invalid score');
+  score = Math.max(1, Math.min(10, score));
+  let category = String(data.category || '').trim();
+  category = category.charAt(0).toUpperCase() + category.slice(1).toLowerCase();
+  if (!['Adult','General'].includes(category)) category = 'General';
+  let foul = data.foul_language;
+  if (typeof foul === 'string') foul = ['true','yes','1'].includes(foul.trim().toLowerCase());
+  foul = !!foul;
+  let style = String(data.style || '').trim();
+  let matched = STYLES.find(s => s.toLowerCase() === style.toLowerCase());
+  if (!matched) {
+    const norm = style.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (norm) matched = STYLES.find(s => {
+      const sn = s.toLowerCase().replace(/[^a-z0-9]/g, '');
+      return sn.includes(norm) || norm.includes(sn);
+    });
+  }
+  return { score, category, foul_language: foul, style: matched || 'Other',
+           reason: String(data.reason || '').slice(0, 500) };
+}
+
+async function rate() {
+  const joke = document.getElementById('joke').value.trim();
+  const btn = document.getElementById('go');
+  hideErr();
+  if (!joke) { showErr('Type a joke first 🙂'); return; }
+  const key = getKey();
+  if (!key) { resetKey(); showErr('Add your OpenRouter key first 👆 (stored only in your browser)'); return; }
+  btn.disabled = true; btn.textContent = 'Judging…';
+  const entry = { ts: new Date().toISOString(), input: joke, model: MODEL };
+  const started = Date.now();
+  try {
+    const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json',
+                 'HTTP-Referer': location.origin, 'X-Title': 'jevjoke' },
+      body: JSON.stringify({ model: MODEL, temperature: 0.2, messages: [
+        { role: 'system', content: SYSTEM }, { role: 'user', content: joke } ] })
+    });
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.error?.message || ('HTTP ' + r.status));
+    const content = body.choices?.[0]?.message?.content || '';
+    const result = parseResult(content);
+    entry.ok = true; entry.output = result;
+    entry.meta = { latency_ms: Date.now() - started, usage: body.usage || null };
+    document.getElementById('score').textContent = result.score;
+    document.getElementById('barfill').style.width = (result.score * 10) + '%';
+    document.getElementById('cat').textContent = result.category;
+    document.getElementById('foul').textContent = result.foul_language ? 'Yes 🤬' : 'No ✅';
+    document.getElementById('style').textContent = result.style;
+    document.getElementById('reason').textContent = result.reason || '';
+    document.getElementById('result').style.display = 'block';
+  } catch (e) {
+    entry.ok = false; entry.error = String(e.message || e);
+    showErr('Error: ' + (e.message || e));
+  } finally {
+    addLog(entry);
+    btn.disabled = false; btn.textContent = 'Rate this joke';
+  }
+}
+
+document.getElementById('joke').addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') rate();
+});
+document.getElementById('logcount').textContent = getLog().length;
+if (!getKey()) resetKey();
+</script>
+</body>
+</html>
