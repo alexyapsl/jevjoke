@@ -62,20 +62,26 @@ Rules:
 
 
 def load_env():
-    """Populate os.environ from a local .env file (KEY=VALUE lines), without
-    overriding variables that are already set."""
-    env_path = BASE_DIR / ".env"
-    if not env_path.exists():
-        return
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    """Populate os.environ from local key files (.env, openai_key.env).
+    Supports KEY=VALUE lines and bare raw-key lines (e.g. a lone sk-or-...
+    key), without overriding variables that are already set."""
+    for env_path in (BASE_DIR / ".env", BASE_DIR / "openai_key.env"):
+        if not env_path.exists():
             continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                # bare raw key on its own line
+                if line.startswith("sk-or-") and "OPENROUTER_API_KEY" not in os.environ:
+                    os.environ["OPENROUTER_API_KEY"] = line.strip('"').strip("'")
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
 
 
 def call_openrouter(joke: str) -> dict:
