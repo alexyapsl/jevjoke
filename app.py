@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-jevjoke — Joke rating & categorizing tool powered by the JEV AI model via OpenRouter.
+jevjoke — Joke rating & categorizing tool powered DIRECTLY by Jev,
+TypeSafe's System One model (typed judgments + probabilities, no generated text).
 
 Zero-dependency: uses only the Python standard library.
 
 Run:
-    set OPENROUTER_API_KEY=sk-or-...   (or put it in a .env file next to this script)
-    py app.py                          # then open http://localhost:8787
+    set TYPESAFE_API_KEY=***   (or put it in jev_apikey.env next to this script)
+    py app.py                  # then open http://localhost:8790
 
 Config via environment:
-    OPENROUTER_API_KEY  (required)  OpenRouter API key
-    JEV_MODEL           (optional)  default: typesafe/jev-router
-    PORT                (optional)  default: 8790
+    TYPESAFE_API_KEY  (required)  TypeSafe API key (https://typesafe.ai)
+    JEV_MODEL         (optional)  default: jev-latest
+    PORT              (optional)  default: 8790
 """
 
 import json
 import os
-import re
 import time
 import urllib.request
 import urllib.error
@@ -27,6 +27,8 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = LOG_DIR / "joke_ratings.jsonl"
+
+TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
 
 STYLES = [
     "One-Liners",
@@ -41,31 +43,51 @@ STYLES = [
     "Anti-Jokes",
 ]
 
-CATEGORIES = ["Adult", "General"]
 
-SYSTEM_PROMPT = """You are JEV-Judge, a precise joke analysis engine.
-Analyze the joke the user provides and respond with ONLY a single JSON object
-(no markdown, no code fences, no extra text) with exactly these keys:
-
-{
-  "score": <integer 1-10, where 1 = painfully dry / not funny and 10 = extremely funny>,
-  "category": <"Adult" or "General">,
-  "foul_language": <true or false>,
-  "style": <exactly one of: One-Liners | Puns and Wordplay | Dad Jokes | Knock-Knock Jokes | Observational Humor | Riddles | Dark Humor | Slapstick | Deadpan | Anti-Jokes>,
-  "reason": <one short sentence justifying the score>
-}
-
-Rules:
-- "Adult" means sexual, crude, or otherwise 18+ themed content; otherwise "General".
-- "foul_language" is true only if the joke text itself contains profanity/swear words.
-- Pick the single best-fitting style from the list, even if none is perfect."""
+def build_questions() -> dict:
+    """The four typed judgments Jev makes about a joke."""
+    return {
+        "funniness": {
+            "type": "score",
+            "instructions": "How funny is this joke, from painfully dry to hilarious?",
+            "criteria": [
+                "1 - painfully dry, not funny at all",
+                "2", "3", "4",
+                "5 - mildly amusing",
+                "6", "7", "8", "9",
+                "10 - extremely funny, laugh out loud",
+            ],
+        },
+        "foul_language": {
+            "type": "noul",
+            "instructions": "Does the joke text itself contain profanity or swear words?",
+            "criteria": {
+                "true": "The joke text contains profanity or swear words",
+                "false": "The joke text is clean",
+            },
+        },
+        "audience": {
+            "type": "choice",
+            "instructions": "Is this joke adult-themed or suitable for a general audience?",
+            "criteria": {
+                "Adult": "Sexual, crude, or otherwise 18+ themed content",
+                "General": "Suitable for a general audience",
+            },
+        },
+        "style": {
+            "type": "choice",
+            "instructions": "Which single joke style best fits this joke?",
+            "criteria": {s: None for s in STYLES},
+        },
+    }
 
 
 def load_env():
-    """Populate os.environ from local key files (.env, openai_key.env).
-    Supports KEY=VALUE lines and bare raw-key lines (e.g. a lone sk-or-...
-    key), without overriding variables that are already set."""
-    for env_path in (BASE_DIR / ".env", BASE_DIR / "openai_key.env"):
+    """Populate os.environ from local key files (.env, openai_key.env, jev_apikey.env).
+    Supports KEY=*** lines and bare raw-key lines, without overriding
+    variables that are already set."""
+    for env_path in (BASE_DIR / ".env", BASE_DIR / "jev_apikey.env",
+                     BASE_DIR / "openai_key.env"):
         if not env_path.exists():
             continue
         for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -74,7 +96,9 @@ def load_env():
                 continue
             if "=" not in line:
                 # bare raw key on its own line
-                if line.startswith("sk-or-") and "OPENROUTER_API_KEY" not in os.environ:
+                if line.startswith("apikey_") and "TYPESAFE_API_KEY" not in os.environ:
+                    os.environ["TYPESAFE_API_KEY"] = line.strip('"').strip("'")
+                elif line.startswith("sk-or-") and "OPENROUTER_API_KEY" not in os.environ:
                     os.environ["OPENROUTER_API_KEY"] = line.strip('"').strip("'")
                 continue
             key, _, value = line.partition("=")
@@ -84,116 +108,80 @@ def load_env():
                 os.environ[key] = value
 
 
-def call_openrouter(joke: str) -> dict:
-    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+def call_jev(joke: str) -> dict:
+    api_key = os.environ.get("TYPESAFE_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError(
-            "OPENROUTER_API_KEY is not set. Export it or add it to a .env file."
+            "TYPESAFE_API_KEY is not set. Export it or add it to jev_apikey.env."
         )
-    model = os.environ.get("JEV_MODEL", "typesafe/jev-router")
+    model = os.environ.get("JEV_MODEL", "jev-latest")
 
     payload = {
+        "state": joke,
         "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": joke},
-        ],
-        "temperature": 0.2,
+        "questions": build_questions(),
     }
     req = urllib.request.Request(
-        "https://openrouter.ai/api/v1/chat/completions",
+        TYPESAFE_URL,
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/alexyapsl/jevjoke",
-            "X-Title": "jevjoke",
         },
         method="POST",
     )
     started = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:500]
-        raise RuntimeError(f"OpenRouter HTTP {e.code}: {detail}") from e
+        raise RuntimeError(f"TypeSafe HTTP {e.code}: {detail}") from e
     latency_ms = int((time.time() - started) * 1000)
 
-    content = (
-        body.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
-    ).strip()
-    result = parse_result(content)
+    answers = body.get("answers", {})
+
+    # --- funniness: score is 0-indexed across the 10 criteria levels -> show 1..10
+    fun = answers.get("funniness", {})
+    score_raw = float(fun.get("score", 0.0))          # 0..9 probability-weighted
+    score_1_10 = round(score_raw + 1.0, 1)
+    score_probs = {str(int(k) + 1): v for k, v in (fun.get("probabilities") or {}).items()}
+
+    # --- foul language: noul probability of yes
+    noul = float(answers.get("foul_language", {}).get("noul", 0.0))
+
+    # --- audience: choice Adult/General
+    aud = answers.get("audience", {})
+    category = aud.get("choice", "General")
+    aud_probs = aud.get("probabilities") or {}
+
+    # --- style: choice with full distribution
+    sty = answers.get("style", {})
+    style = sty.get("choice", "Other")
+    style_probs = dict(
+        sorted((sty.get("probabilities") or {}).items(),
+               key=lambda kv: kv[1], reverse=True)
+    )
+
+    result = {
+        "score": score_1_10,
+        "score_confidence": fun.get("confidence"),
+        "score_probabilities": score_probs,
+        "category": category,
+        "category_probability": aud_probs.get(category),
+        "foul_language": noul >= 0.5,
+        "foul_probability": round(noul, 3),
+        "style": style,
+        "style_confidence": sty.get("confidence"),
+        "style_probabilities": style_probs,
+    }
     result["_meta"] = {
-        "model": model,
+        "model": body.get("model", model),   # e.g. jev-1.13.0 — Jev itself
         "latency_ms": latency_ms,
         "usage": body.get("usage"),
-        "raw_content": content,
+        "raw_answers": answers,
     }
     return result
-
-
-def parse_result(content: str) -> dict:
-    """Extract and validate the JSON verdict from the model's reply."""
-    text = content.strip()
-    # Strip markdown code fences if present
-    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
-    if fence:
-        text = fence.group(1).strip()
-    # Find the first {...} block if extra text surrounds it
-    if not text.startswith("{"):
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if m:
-            text = m.group(0)
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Model did not return valid JSON. Raw reply: {content[:300]}") from e
-
-    # Normalize / validate
-    score = data.get("score")
-    try:
-        score = int(round(float(score)))
-    except (TypeError, ValueError):
-        raise RuntimeError(f"Model returned an invalid score: {score!r}")
-    score = max(1, min(10, score))
-
-    category = str(data.get("category", "")).strip().capitalize()
-    if category not in CATEGORIES:
-        category = "General"
-
-    foul = data.get("foul_language")
-    if isinstance(foul, str):
-        foul = foul.strip().lower() in ("true", "yes", "1")
-    foul = bool(foul)
-
-    style = str(data.get("style", "")).strip()
-    matched = next((s for s in STYLES if s.lower() == style.lower()), None)
-    if not matched:
-        # fuzzy: compare on alphanumerics only, allow containment either way
-        # (e.g. "knock knock" -> "Knock-Knock Jokes")
-        norm = re.sub(r"[^a-z0-9]", "", style.lower())
-        if norm:
-            matched = next(
-                (
-                    s
-                    for s in STYLES
-                    if norm in re.sub(r"[^a-z0-9]", "", s.lower())
-                    or re.sub(r"[^a-z0-9]", "", s.lower()) in norm
-                ),
-                None,
-            )
-    style = matched or "Other"
-
-    reason = str(data.get("reason", "")).strip()[:500]
-
-    return {
-        "score": score,
-        "category": category,
-        "foul_language": foul,
-        "style": style,
-        "reason": reason,
-    }
 
 
 def log_entry(entry: dict):
@@ -207,7 +195,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>jevjoke &mdash; JEV Joke Rater</title>
+<title>jevjoke &mdash; rated by Jev itself</title>
 <style>
   :root { --bg:#0f1220; --card:#1a1f35; --accent:#7c5cff; --accent2:#00d4ff;
           --text:#e8eaf6; --muted:#9aa3c7; --good:#2ecc71; --warn:#ff5c7a; }
@@ -240,7 +228,18 @@ INDEX_HTML = """<!DOCTYPE html>
   .chip { background:#12162a; border:1px solid #2c3454; border-radius:999px;
           padding:6px 14px; font-size:13px; }
   .chip b { color:var(--accent2); }
-  .reason { margin-top:14px; color:var(--muted); font-size:14px; font-style:italic; }
+  .dist { margin-top:18px; }
+  .dist h3 { margin:0 0 8px; font-size:13px; color:var(--muted);
+             text-transform:uppercase; letter-spacing:.08em; }
+  .drow { display:flex; align-items:center; gap:8px; margin:4px 0; font-size:13px; }
+  .drow .lbl { width:150px; color:var(--muted); white-space:nowrap;
+               overflow:hidden; text-overflow:ellipsis; }
+  .drow .pbar { flex:1; height:8px; background:#12162a; border-radius:5px; overflow:hidden; }
+  .drow .pbar > div { height:100%; background:var(--accent); width:0;
+                      transition:width .6s ease; }
+  .drow .pct { width:44px; text-align:right; color:var(--accent2); }
+  .drow.top .lbl { color:var(--text); font-weight:600; }
+  .meta { margin-top:14px; color:#5b6488; font-size:12px; }
   .err { margin-top:16px; color:var(--warn); font-size:14px; display:none;
          white-space:pre-wrap; }
   .foot { margin-top:22px; color:#5b6488; font-size:12px; text-align:center; }
@@ -249,8 +248,8 @@ INDEX_HTML = """<!DOCTYPE html>
 <body>
   <div class="card">
     <h1>😂 jevjoke</h1>
-    <div class="sub">Paste a joke below. The <b>JEV</b> model (via OpenRouter) will score it
-      from bone-dry (1) to hilarious (10) and categorize it.</div>
+    <div class="sub">Paste a joke below. <b>Jev itself</b> (TypeSafe System One)
+      judges it directly &mdash; typed probabilities, no generated text, no middleman.</div>
     <textarea id="joke" placeholder="Why did the chicken cross the road? ..."></textarea>
     <button id="go" onclick="rate()">Rate this joke</button>
 
@@ -264,20 +263,36 @@ INDEX_HTML = """<!DOCTYPE html>
         <span class="chip">Foul language: <b id="foul"></b></span>
         <span class="chip">Style: <b id="style"></b></span>
       </div>
-      <div class="reason" id="reason"></div>
+      <div class="dist">
+        <h3>Jev's style distribution</h3>
+        <div id="styledist"></div>
+      </div>
+      <div class="dist">
+        <h3>Funniness distribution (1&ndash;10)</h3>
+        <div id="scoredist"></div>
+      </div>
+      <div class="meta" id="meta"></div>
     </div>
     <div class="err" id="err"></div>
-    <div class="foot">Powered by JEV via OpenRouter &middot; every rating is logged server-side</div>
+    <div class="foot">Judged directly by Jev via the TypeSafe System One API &middot;
+      every rating is logged server-side</div>
   </div>
 
 <script>
+function distRow(label, p, top) {
+  return '<div class="drow' + (top ? ' top' : '') + '">' +
+    '<span class="lbl">' + label + '</span>' +
+    '<span class="pbar"><div style="width:' + (p * 100).toFixed(1) + '%"></div></span>' +
+    '<span class="pct">' + Math.round(p * 100) + '%</span></div>';
+}
+
 async function rate() {
   const joke = document.getElementById('joke').value.trim();
   const btn = document.getElementById('go');
   const err = document.getElementById('err');
   err.style.display = 'none';
   if (!joke) { err.textContent = 'Type a joke first 🙂'; err.style.display = 'block'; return; }
-  btn.disabled = true; btn.textContent = 'Judging…';
+  btn.disabled = true; btn.textContent = 'Jev is judging…';
   try {
     const r = await fetch('/api/rate', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -285,12 +300,31 @@ async function rate() {
     });
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+
     document.getElementById('score').textContent = data.score;
     document.getElementById('barfill').style.width = (data.score * 10) + '%';
-    document.getElementById('cat').textContent = data.category;
-    document.getElementById('foul').textContent = data.foul_language ? 'Yes 🤬' : 'No ✅';
+    document.getElementById('cat').textContent =
+      data.category + ' (' + Math.round((data.category_probability || 0) * 100) + '%)';
+    document.getElementById('foul').textContent =
+      (data.foul_language ? 'Yes 🤬' : 'No ✅') +
+      ' (' + Math.round((data.foul_probability || 0) * 100) + '% sure)';
     document.getElementById('style').textContent = data.style;
-    document.getElementById('reason').textContent = data.reason || '';
+
+    // style distribution: top 3 + chosen highlighted
+    const sp = data.style_probabilities || {};
+    let shtml = '';
+    Object.entries(sp).slice(0, 3).forEach(([k, v], i) => { shtml += distRow(k, v, i === 0); });
+    document.getElementById('styledist').innerHTML = shtml;
+
+    // funniness distribution 1..10
+    const fp = data.score_probabilities || {};
+    let fhtml = '';
+    Object.entries(fp).forEach(([k, v]) => { if (v > 0.005) fhtml += distRow(k, v, false); });
+    document.getElementById('scoredist').innerHTML = fhtml || '<div class="drow">—</div>';
+
+    document.getElementById('meta').textContent =
+      'Judged by ' + data.jev_model + ' in ' + data.latency_ms + 'ms' +
+      ' · score confidence ' + Math.round((data.score_confidence || 0) * 100) + '%';
     document.getElementById('result').style.display = 'block';
   } catch (e) {
     err.textContent = 'Error: ' + e.message;
@@ -309,7 +343,7 @@ document.getElementById('joke').addEventListener('keydown', e => {
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "jevjoke/1.0"
+    server_version = "jevjoke/2.0"
 
     def _send(self, code: int, body: bytes, ctype: str):
         self.send_response(code)
@@ -357,9 +391,12 @@ class Handler(BaseHTTPRequestHandler):
             "input": joke,
         }
         try:
-            result = call_openrouter(joke)
+            result = call_jev(joke)
             meta = result.pop("_meta", {})
             entry.update({"ok": True, "output": result, "meta": meta})
+            # surface a few meta fields for the UI
+            result["jev_model"] = meta.get("model")
+            result["latency_ms"] = meta.get("latency_ms")
             self._json(200, result)
         except Exception as e:
             entry.update({"ok": False, "error": str(e)})
@@ -371,10 +408,10 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     load_env()
     port = int(os.environ.get("PORT", "8790"))
-    if not os.environ.get("OPENROUTER_API_KEY"):
-        print("⚠️  OPENROUTER_API_KEY is not set — ratings will fail until it is.")
+    if not os.environ.get("TYPESAFE_API_KEY"):
+        print("⚠️  TYPESAFE_API_KEY is not set — ratings will fail until it is.")
     print(f"🃏 jevjoke listening on http://localhost:{port}")
-    print(f"   model: {os.environ.get('JEV_MODEL', 'typesafe/jev-router')}")
+    print(f"   model: {os.environ.get('JEV_MODEL', 'jev-latest')} (Jev itself, via TypeSafe System One API)")
     print(f"   log:   {LOG_FILE}")
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
