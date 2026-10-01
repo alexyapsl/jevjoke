@@ -17,9 +17,11 @@ Config via environment:
 
 import json
 import os
+import sys
 import time
 import urllib.request
 import urllib.error
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -182,6 +184,22 @@ def call_jev(joke: str) -> dict:
         "raw_answers": answers,
     }
     return result
+
+
+# --- tiny in-memory rate limiter (protects the TypeSafe quota on public deploys)
+RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_MIN", "20"))
+_hits: dict = defaultdict(deque)
+
+
+def rate_limited(ip: str) -> bool:
+    now = time.time()
+    q = _hits[ip]
+    while q and now - q[0] > 60:
+        q.popleft()
+    if len(q) >= RATE_LIMIT:
+        return True
+    q.append(now)
+    return False
 
 
 def log_entry(entry: dict):
@@ -349,8 +367,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # CORS: allow the GitHub Pages frontend (or any origin if unset) to call /api/*
+        origin = os.environ.get("ALLOWED_ORIGIN", "*")
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self._send(204, b"", "text/plain")
 
     def _json(self, code: int, obj: dict):
         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
@@ -376,6 +402,10 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         except (ValueError, json.JSONDecodeError):
             self._json(400, {"error": "invalid JSON body"})
+            return
+
+        if rate_limited(self.client_address[0]):
+            self._json(429, {"error": "rate limit exceeded — wait a minute and try again"})
             return
 
         joke = str(payload.get("joke", "")).strip()
@@ -406,6 +436,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # tolerate non-UTF-8 consoles/pipes (emoji in logs would otherwise crash)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     load_env()
     port = int(os.environ.get("PORT", "8790"))
     if not os.environ.get("TYPESAFE_API_KEY"):
